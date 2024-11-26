@@ -399,6 +399,15 @@ pub struct RegisterEntityCheck {
 
 /// Request for the nodes providing a specified service registered in Consul.
 #[derive(Clone, Debug, SmartDefault, Serialize, Deserialize, PartialEq)]
+pub struct GetServicesRequest<'a> {
+    /// (string: "") Specifies the expression used to filter the queries results prior to returning the data.
+    pub filter: Option<&'a str>,
+}
+
+pub(crate) type GetServicesResponse = HashMap<String, Vec<String>>;
+
+/// Request for the nodes providing a specified service registered in Consul.
+#[derive(Clone, Debug, SmartDefault, Serialize, Deserialize, PartialEq)]
 pub struct GetServiceNodesRequest<'a> {
     /// Specifies the service to list services for. This is provided as part of the URL.
     pub service: &'a str,

@@ -641,6 +641,33 @@ impl Consul {
         })
     }
 
+    /// Returns all services currently registered with consul.
+    /// See https://www.consul.io/api-docs/catalog#list-services for more information.
+    /// # Arguments:
+    /// - query_opts: The [`QueryOptions`](QueryOptions) to apply for this endpoint.
+    /// # Errors:
+    /// [ConsulError](consul::ConsulError) describes all possible errors returned by this api.
+    /// returns the nodes providing the service indicated on the path.
+    pub async fn get_services(
+        &self,
+        request: GetServicesRequest<'_>,
+        query_opts: Option<QueryOptions>,
+    ) -> Result<ResponseMeta<GetServicesResponse>> {
+        let query_opts = query_opts.unwrap_or_default();
+        let req = self.build_get_services_req(request, &query_opts);
+        let (response_body, index) = self
+            .execute_request(
+                req,
+                BoxBody::new(Empty::<Bytes>::new()),
+                query_opts.timeout,
+                Function::GetServices,
+            )
+            .await?;
+        let response = serde_json::from_reader::<_, GetServicesResponse>(response_body.reader())
+            .map_err(ConsulError::ResponseDeserializationFailed)?;
+        Ok(ResponseMeta { response, index })
+    }
+
     /// returns the nodes providing the service indicated on the path.
     /// Users can also build in support for dynamic load balancing and other features by incorporating the use of health checks.
     /// See the [consul docs](https://www.consul.io/api-docs/health#list-nodes-for-service) for more information.
@@ -787,6 +814,25 @@ impl Consul {
             .await?;
         serde_json::from_reader(response_body.reader())
             .map_err(ConsulError::ResponseDeserializationFailed)
+    }
+
+    fn build_get_services_req(
+        &self,
+        request: GetServicesRequest<'_>,
+        query_opts: &QueryOptions,
+    ) -> http::request::Builder {
+        let mut url = self.config.address.clone();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(["v1", "catalog", "services"]);
+        let mut query_params = url.query_pairs_mut();
+        if let Some(filter) = request.filter {
+            query_params.append_pair("filter", filter);
+        }
+        add_query_option_params(query_params, query_opts);
+
+        let req = hyper::Request::builder().method(Method::GET);
+        req.uri(url.as_str())
     }
 
     fn build_get_service_nodes_req(
@@ -1024,6 +1070,40 @@ mod tests {
             .expect("expected deregister_entity request to succeed");
 
         assert!(!is_registered(&consul, &new_service_name).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn get_services() {
+        let consul = get_client();
+        let req = GetServicesRequest {
+            ..Default::default()
+        };
+        let ResponseMeta { response, .. } = consul.get_services(req, None).await.unwrap();
+        assert!(response.contains_key("test-service"));
+
+        let req = GetServicesRequest {
+            filter: Some("\"filter\" in ServiceTags"),
+        };
+        let ResponseMeta { response, .. } = consul.get_services(req, None).await.unwrap();
+        let test_service_tags = response.get("test-service").cloned().map(|mut tags| {
+            tags.sort_unstable();
+            tags
+        });
+        assert_eq!(
+            test_service_tags,
+            Some(vec![
+                "filter".to_string(),
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string(),
+            ])
+        );
+
+        let req = GetServicesRequest {
+            filter: Some("\"filter\" not in ServiceTags"),
+        };
+        let ResponseMeta { response, .. } = consul.get_services(req, None).await.unwrap();
+        assert!(!response.contains_key("test-service"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

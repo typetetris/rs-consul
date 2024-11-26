@@ -11,7 +11,7 @@ services {
   address = "1.1.1.1"
   port = 20001
   checks = []
-  tags = ["first"]
+  tags = ["first", "filter"]
 }
 
 services {
@@ -20,7 +20,7 @@ services {
   address = "2.2.2.2"
   port = 20002
   checks = []
-  tags = ["second"]
+  tags = ["second", "filter"]
 }
 
 services {
@@ -29,5 +29,5 @@ services {
   address = "3.3.3.3"
   port = 20003
   checks = []
-  tags = ["third"]
+  tags = ["third", "filter"]
 }
