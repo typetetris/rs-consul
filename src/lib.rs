@@ -130,7 +130,7 @@ pub(crate) type Result<T> = std::result::Result<T, ConsulError>;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     /// The address of the consul server. This must include the protocol to connect over eg. http or https.
-    pub address: String,
+    pub address: url::Url,
     /// The consul secret token to make authenticated requests to the consul server.
     pub token: Option<String>,
 
@@ -151,7 +151,7 @@ fn default_builder() -> Builder {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            address: String::default(),
+            address: Self::default_url(),
             token: None,
             hyper_builder: default_builder(),
         }
@@ -159,14 +159,17 @@ impl Default for Config {
 }
 
 impl Config {
+    fn default_url() -> url::Url {
+        url::Url::parse("http://127.0.0.1:8500").unwrap()
+    }
     /// Obtains a [`Config`](consul::Config) from environment variables.
     /// Specifically, looks for `CONSUL_HTTP_TOKEN` and `CONSUL_HTTP_ADDR` as environment variables.
     /// # Errors
     /// Returns an [error](env::VarError) if either environment variable is missing.
     pub fn from_env() -> Self {
         let token = env::var("CONSUL_HTTP_TOKEN").unwrap_or_default();
-        let addr =
-            env::var("CONSUL_HTTP_ADDR").unwrap_or_else(|_| "http://127.0.0.1:8500".to_string());
+        let addr = env::var("CONSUL_HTTP_ADDR")
+            .map_or_else(|_| Self::default_url(), |v| url::Url::parse(&v).unwrap());
 
         Config {
             address: addr,
@@ -367,7 +370,9 @@ impl Consul {
         value: Vec<u8>,
     ) -> Result<(bool, u64)> {
         let url = self.build_create_or_update_url(request);
-        let req = hyper::Request::builder().method(Method::PUT).uri(url);
+        let req = hyper::Request::builder()
+            .method(Method::PUT)
+            .uri(url.as_str());
         let (response_body, index) = self
             .execute_request(
                 req,
@@ -407,7 +412,7 @@ impl Consul {
             None,
             self.metrics_tx.clone(),
         );
-        let result = ureq::put(&url)
+        let result = ureq::put(url.as_str())
             .set(
                 "X-Consul-Token",
                 &self.config.token.clone().unwrap_or_default(),
@@ -454,17 +459,18 @@ impl Consul {
     /// [ConsulError](consul::ConsulError) describes all possible errors returned by this api.
     pub async fn delete_key(&self, request: DeleteKeyRequest<'_>) -> Result<bool> {
         let mut req = hyper::Request::builder().method(Method::DELETE);
-        let mut url = String::new();
-        url.push_str(&format!(
-            "{}/v1/kv/{}?recurse={}",
-            self.config.address, request.key, request.recurse
-        ));
+        let mut url = self.config.address.clone();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(["v1", "kv"].into_iter().chain(request.key.split("/")));
+        let mut query_params = url.query_pairs_mut();
+        query_params.append_pair("recurse", &format!("{}", request.recurse));
         if request.check_and_set != 0 {
-            url.push_str(&format!("&cas={}", request.check_and_set));
+            query_params.append_pair("cas", &format!("{}", request.check_and_set));
         }
 
-        url = add_namespace_and_datacenter(url, request.namespace, request.datacenter);
-        req = req.uri(url);
+        add_namespace_and_datacenter(query_params, request.namespace, request.datacenter);
+        req = req.uri(url.as_str());
         let (response_body, _index) = self
             .execute_request(
                 req,
@@ -554,8 +560,13 @@ impl Consul {
     /// # Errors:
     /// [ConsulError](consul::ConsulError) describes all possible errors returned by this api.
     pub async fn register_entity(&self, payload: &RegisterEntityPayload) -> Result<()> {
-        let uri = format!("{}/v1/catalog/register", self.config.address);
-        let request = hyper::Request::builder().method(Method::PUT).uri(uri);
+        let mut url = self.config.address.clone();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(["v1", "catalog", "register"]);
+        let request = hyper::Request::builder()
+            .method(Method::PUT)
+            .uri(url.as_str());
         let payload = serde_json::to_string(payload).map_err(ConsulError::InvalidRequest)?;
         self.execute_request(
             request,
@@ -574,8 +585,13 @@ impl Consul {
     /// # Errors:
     /// [ConsulError](consul::ConsulError) describes all possible errors returned by this api.
     pub async fn deregister_entity(&self, payload: &DeregisterEntityPayload) -> Result<()> {
-        let uri = format!("{}/v1/catalog/deregister", self.config.address);
-        let request = hyper::Request::builder().method(Method::PUT).uri(uri);
+        let mut url = self.config.address.clone();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(["v1", "catalog", "deregister"]);
+        let request = hyper::Request::builder()
+            .method(Method::PUT)
+            .uri(url.as_str());
         let payload = serde_json::to_string(payload).map_err(ConsulError::InvalidRequest)?;
         self.execute_request(
             request,
@@ -597,13 +613,16 @@ impl Consul {
         &self,
         query_opts: Option<QueryOptions>,
     ) -> Result<ResponseMeta<Vec<String>>> {
-        let mut uri = format!("{}/v1/catalog/services", self.config.address);
+        let mut url = self.config.address.clone();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(["v1", "catalog", "services"]);
         let query_opts = query_opts.unwrap_or_default();
-        add_query_option_params(&mut uri, &query_opts, '?');
+        add_query_option_params(url.query_pairs_mut(), &query_opts);
 
         let request = hyper::Request::builder()
             .method(Method::GET)
-            .uri(uri.clone());
+            .uri(url.as_str());
         let (response_body, index) = self
             .execute_request(
                 request,
@@ -710,33 +729,32 @@ impl Consul {
     }
 
     fn build_read_key_req(&self, request: ReadKeyRequest<'_>) -> http::request::Builder {
-        let req = hyper::Request::builder().method(Method::GET);
-        let mut url = String::new();
-        url.push_str(&format!(
-            "{}/v1/kv/{}?recurse={}",
-            self.config.address, request.key, request.recurse
-        ));
+        let mut url = self.config.address.clone();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(["v1", "kv"].into_iter().chain(request.key.split("/")));
+
+        let mut query_params = url.query_pairs_mut();
+        query_params.append_pair("recurse", &format!("{}", request.recurse));
 
         if !request.separator.is_empty() {
-            url.push_str(&format!("&separator={}", request.separator));
+            query_params.append_pair("separator", request.separator);
         }
         if request.consistency == ConsistencyMode::Consistent {
-            url.push_str("&consistent");
+            query_params.append_key_only("consistent");
         } else if request.consistency == ConsistencyMode::Stale {
-            url.push_str("&stale");
+            query_params.append_key_only("stale");
         }
 
         if let Some(index) = request.index {
-            url.push_str(&format!("&index={}", index));
+            query_params.append_pair("index", &format!("{}", index));
             if request.wait.as_secs() > 0 {
-                url.push_str(&format!(
-                    "&wait={}",
-                    types::duration_as_string(&request.wait)
-                ));
+                query_params.append_pair("wait", &types::duration_as_string(&request.wait));
             }
         }
-        url = add_namespace_and_datacenter(url, request.namespace, request.datacenter);
-        req.uri(url)
+        add_namespace_and_datacenter(query_params, request.namespace, request.datacenter);
+        let req = hyper::Request::builder().method(Method::GET);
+        req.uri(url.as_str())
     }
 
     async fn get_session(&self, request: LockRequest<'_>) -> Result<SessionResponse> {
@@ -747,11 +765,14 @@ impl Consul {
             ..Default::default()
         };
 
+        let mut url = self.config.address.clone();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(["v1", "session", "create"]);
+        add_namespace_and_datacenter(url.query_pairs_mut(), request.namespace, request.datacenter);
+
         let mut req = hyper::Request::builder().method(Method::PUT);
-        let mut url = String::new();
-        url.push_str(&format!("{}/v1/session/create?", self.config.address));
-        url = add_namespace_and_datacenter(url, request.namespace, request.datacenter);
-        req = req.uri(url);
+        req = req.uri(url.as_str());
         let create_session_json =
             serde_json::to_string(&session_req).map_err(ConsulError::InvalidRequest)?;
         let (response_body, _index) = self
@@ -773,21 +794,24 @@ impl Consul {
         request: GetServiceNodesRequest<'_>,
         query_opts: &QueryOptions,
     ) -> http::request::Builder {
-        let req = hyper::Request::builder().method(Method::GET);
-        let mut url = String::new();
-        url.push_str(&format!(
-            "{}/v1/health/service/{}",
-            self.config.address, request.service
-        ));
-        url.push_str(&format!("?passing={}", request.passing));
+        let mut url = self.config.address.clone();
+        url.path_segments_mut().unwrap().extend(
+            ["v1", "health", "service"]
+                .into_iter()
+                .chain(request.service.split("/")),
+        );
+        let mut query_params = url.query_pairs_mut();
+        query_params.append_pair("passing", &format!("{}", request.passing));
         if let Some(near) = request.near {
-            url.push_str(&format!("&near={}", near));
+            query_params.append_pair("near", near);
         }
         if let Some(filter) = request.filter {
-            url.push_str(&format!("&filter={}", filter));
+            query_params.append_pair("filter", filter);
         }
-        add_query_option_params(&mut url, query_opts, '&');
-        req.uri(url)
+        add_query_option_params(query_params, query_opts);
+
+        let req = hyper::Request::builder().method(Method::GET);
+        req.uri(url.as_str())
     }
 
     async fn execute_request<'a>(
@@ -876,83 +900,64 @@ impl Consul {
         }
     }
 
-    fn build_create_or_update_url(&self, request: CreateOrUpdateKeyRequest<'_>) -> String {
-        let mut url = String::new();
-        url.push_str(&format!("{}/v1/kv/{}", self.config.address, request.key));
-        let mut added_query_param = false;
+    fn build_create_or_update_url(&self, request: CreateOrUpdateKeyRequest<'_>) -> url::Url {
+        let mut url = self.config.address.clone();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(["v1", "kv"].into_iter().chain(request.key.split("/")));
+        let mut query_params = url.query_pairs_mut();
+
         if request.flags != 0 {
-            url = add_query_param_separator(url, added_query_param);
-            url.push_str(&format!("flags={}", request.flags));
-            added_query_param = true;
+            query_params.append_pair("flags", &format!("{}", request.flags));
         }
         if !request.acquire.is_empty() {
-            url = add_query_param_separator(url, added_query_param);
-            url.push_str(&format!("acquire={}", request.acquire));
-            added_query_param = true;
+            query_params.append_pair("acquire", request.acquire);
         }
         if !request.release.is_empty() {
-            url = add_query_param_separator(url, added_query_param);
-            url.push_str(&format!("release={}", request.release));
-            added_query_param = true;
+            query_params.append_pair("release", request.release);
         }
         if let Some(cas_idx) = request.check_and_set {
-            url = add_query_param_separator(url, added_query_param);
-            url.push_str(&format!("cas={}", cas_idx));
+            query_params.append_pair("cas", &format!("{}", cas_idx));
         }
 
-        add_namespace_and_datacenter(url, request.namespace, request.datacenter)
+        add_namespace_and_datacenter(query_params, request.namespace, request.datacenter);
+        url
     }
 }
 
-fn add_query_option_params(uri: &mut String, query_opts: &QueryOptions, mut separator: char) {
+fn add_query_option_params(
+    mut query_params: url::form_urlencoded::Serializer<'_, url::UrlQuery<'_>>,
+    query_opts: &QueryOptions,
+) {
     if let Some(ns) = &query_opts.namespace {
         if !ns.is_empty() {
-            uri.push_str(&format!("{}ns={}", separator, ns));
-            separator = '&';
+            query_params.append_pair("ns", ns);
         }
     }
     if let Some(dc) = &query_opts.datacenter {
         if !dc.is_empty() {
-            uri.push_str(&format!("{}dc={}", separator, dc));
-            separator = '&';
+            query_params.append_pair("dc", dc);
         }
     }
     if let Some(idx) = query_opts.index {
-        uri.push_str(&format!("{}index={}", separator, idx));
-        separator = '&';
+        query_params.append_pair("index", &format!("{}", idx));
         if let Some(wait) = query_opts.wait {
-            uri.push_str(&format!(
-                "{}wait={}",
-                separator,
-                types::duration_as_string(&wait)
-            ));
+            query_params.append_pair("wait", &types::duration_as_string(&wait));
         }
     }
 }
 
 fn add_namespace_and_datacenter<'a>(
-    mut url: String,
+    mut query_params: url::form_urlencoded::Serializer<'_, url::UrlQuery<'_>>,
     namespace: &'a str,
     datacenter: &'a str,
-) -> String {
+) {
     if !namespace.is_empty() {
-        url.push_str(&format!("&ns={}", namespace));
+        query_params.append_pair("ns", namespace);
     }
     if !datacenter.is_empty() {
-        url.push_str(&format!("&dc={}", datacenter));
+        query_params.append_pair("dc", datacenter);
     }
-
-    url
-}
-
-fn add_query_param_separator(mut url: String, already_added: bool) -> String {
-    if already_added {
-        url.push('&');
-    } else {
-        url.push('?');
-    }
-
-    url
 }
 
 #[cfg(test)]

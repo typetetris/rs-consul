@@ -30,3 +30,4 @@ slog-scope = "4"
 smart-default = "0.7"
 tokio = { version = "1", features = ["full"] }
 ureq = { version = "2", features = ["json"] }
+url = { version = "2.5.4", features = ["serde"] }
