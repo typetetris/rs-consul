@@ -33,6 +33,7 @@ use metrics::MetricInfoWrapper;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{env, str::Utf8Error};
 
@@ -668,6 +669,89 @@ impl Consul {
         Ok(ResponseMeta { response, index })
     }
 
+    /// Returns a watch receiver publishing [`get_services`](get_services) result.
+    ///
+    /// If a request to consul fails the error will be published and the watch sender
+    /// will be dropped afterwards. This happens not in case of a timeout. If a request
+    /// timed out, which is not the first request, the next request will be started.
+    ///
+    /// If sending on the watch sender fails, the watch sender will be dropped.
+    ///
+    /// /// # Arguments:
+    /// - initial_query_opts: The [`QueryOptions`](QueryOptions) to apply for this endpoint for
+    ///                       the first request. `index` will be ignored.
+    /// - blocking_timeout: `QueryOptions` `timeout` to apply for all later requests.
+    /// - blocking_wait: `QueryOptions` `wait` to apply for all later requests.
+    /// # Errors:
+    /// [ConsulError](consul::ConsulError) describes all possible errors returned by this api.
+    /// returns the nodes providing the service indicated on the path.
+    pub async fn get_services_watch(
+        client: Arc<Self>,
+        request: GetServicesRequest<'_>,
+        initial_query_opts: Option<QueryOptions>,
+        blocking_timeout: Option<Duration>,
+        blocking_wait: Option<Duration>,
+    ) -> tokio::sync::watch::Receiver<Result<ResponseMeta<GetServicesResponse>>> {
+        let query_opts = QueryOptions {
+            index: None,
+            ..initial_query_opts.unwrap_or_default()
+        };
+
+        let res = client
+            .get_services(request.clone(), Some(query_opts.clone()))
+            .await;
+        let mut last_index = match &res {
+            Err(_) => 1,
+            Ok(result) => result.index,
+        };
+        let res_is_err = res.is_err();
+        let (tx, rx) = tokio::sync::watch::channel(res);
+        if res_is_err {
+            return rx;
+        }
+
+        let filter_option = request.filter.map(str::to_string);
+        let query_opts = QueryOptions {
+            index: Some(last_index),
+            wait: blocking_wait,
+            timeout: blocking_timeout,
+            ..query_opts
+        };
+        tokio::spawn(async move {
+            loop {
+                match client
+                    .get_services(
+                        GetServicesRequest {
+                            filter: filter_option.as_deref(),
+                        },
+                        Some(QueryOptions {
+                            index: Some(last_index),
+                            ..query_opts.clone()
+                        }),
+                    )
+                    .await
+                {
+                    Err(ConsulError::TimeoutExceeded(_)) => continue,
+                    Err(other_error) => {
+                        let _ = tx.send(Err(other_error));
+                        break;
+                    }
+                    Ok(result) => {
+                        last_index = if result.index < last_index {
+                            0
+                        } else {
+                            result.index
+                        };
+                        if tx.send(Ok(result)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        rx
+    }
+
     /// returns the nodes providing the service indicated on the path.
     /// Users can also build in support for dynamic load balancing and other features by incorporating the use of health checks.
     /// See the [consul docs](https://www.consul.io/api-docs/health#list-nodes-for-service) for more information.
@@ -694,6 +778,96 @@ impl Consul {
             serde_json::from_reader::<_, GetServiceNodesResponse>(response_body.reader())
                 .map_err(ConsulError::ResponseDeserializationFailed)?;
         Ok(ResponseMeta { response, index })
+    }
+
+    /// Returns a watch receiver publishing [`get_service_nodes`](get_service_nodes) result.
+    ///
+    /// If a request to consul fails the error will be published and the watch sender
+    /// will be dropped afterwards. This happens not in case of a timeout. If a request
+    /// timed out, which is not the first request, the next request will be started.
+    ///
+    /// If sending on the watch sender fails, the watch sender will be dropped.
+    ///
+    /// /// # Arguments:
+    /// - initial_query_opts: The [`QueryOptions`](QueryOptions) to apply for this endpoint for
+    ///                       the first request. `index` will be ignored.
+    /// - blocking_timeout: `QueryOptions` `timeout` to apply for all later requests.
+    /// - blocking_wait: `QueryOptions` `wait` to apply for all later requests.
+    /// # Errors:
+    /// [ConsulError](consul::ConsulError) describes all possible errors returned by this api.
+    /// returns the nodes providing the service indicated on the path.
+    pub async fn get_service_nodes_watch(
+        client: Arc<Self>,
+        request: GetServiceNodesRequest<'_>,
+        initial_query_opts: Option<QueryOptions>,
+        blocking_timeout: Option<Duration>,
+        blocking_wait: Option<Duration>,
+    ) -> tokio::sync::watch::Receiver<Result<ResponseMeta<GetServiceNodesResponse>>> {
+        let query_opts = QueryOptions {
+            index: None,
+            ..initial_query_opts.unwrap_or_default()
+        };
+
+        let res = client
+            .get_service_nodes(request.clone(), Some(query_opts.clone()))
+            .await;
+        let mut last_index = match &res {
+            Err(_) => 1,
+            Ok(result) => result.index,
+        };
+        let res_is_err = res.is_err();
+        let (tx, rx) = tokio::sync::watch::channel(res);
+        if res_is_err {
+            return rx;
+        }
+
+        let filter = request.filter.map(str::to_string);
+        let service = request.service.to_string();
+        let near = request.near.map(str::to_string);
+        let passing = request.passing;
+
+        let query_opts = QueryOptions {
+            index: Some(last_index),
+            wait: blocking_wait,
+            timeout: blocking_timeout,
+            ..query_opts
+        };
+        tokio::spawn(async move {
+            loop {
+                match client
+                    .get_service_nodes(
+                        GetServiceNodesRequest {
+                            filter: filter.as_deref(),
+                            near: near.as_deref(),
+                            service: service.as_ref(),
+                            passing,
+                        },
+                        Some(QueryOptions {
+                            index: Some(last_index),
+                            ..query_opts.clone()
+                        }),
+                    )
+                    .await
+                {
+                    Err(ConsulError::TimeoutExceeded(_)) => continue,
+                    Err(other_error) => {
+                        let _ = tx.send(Err(other_error));
+                        break;
+                    }
+                    Ok(result) => {
+                        last_index = if result.index < last_index {
+                            0
+                        } else {
+                            result.index
+                        };
+                        if tx.send(Ok(result)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        rx
     }
 
     /// Queries consul for a service and returns the Address:Port of all instances registered for that service.
@@ -1107,6 +1281,88 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn get_services_watch() {
+        let tag = "filter_services_watch".to_string();
+        let filter = format!("\"{tag}\" in ServiceTags");
+        let consul = Arc::new(get_client());
+        let req = GetServicesRequest {
+            filter: Some(&filter),
+        };
+        let mut services_watch = Consul::get_services_watch(
+            consul.clone(),
+            req,
+            None,
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+        {
+            let res = services_watch.borrow_and_update();
+            match res.as_ref() {
+                Ok(result) => {
+                    let keys: Vec<String> = result.response.keys().cloned().collect();
+                    assert_eq!(keys, vec![] as Vec<String>)
+                }
+                Err(error) => panic!("unexpected error {error:#?}"),
+            }
+        }
+
+        let service_name = "services-watch".to_string();
+        let service_node_id = "services-watch-node-1".to_string();
+        let node_id = "node-services-watch";
+        register_service_node(
+            consul.as_ref(),
+            &service_name,
+            node_id,
+            Some(vec![tag.clone()]),
+            Some(service_node_id.clone()),
+        )
+        .await;
+
+        match timeout(
+            Duration::from_secs(1),
+            services_watch.wait_for(|value| match value {
+                Ok(result) => {
+                    let keys: Vec<_> = result.response.keys().cloned().collect();
+                    keys == vec![service_name.clone()]
+                }
+                Err(_) => true,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            other => panic!("timeout or error {other:#?}"),
+        }
+
+        consul
+            .deregister_entity(&DeregisterEntityPayload {
+                Node: Some(node_id.to_string()),
+                Datacenter: None,
+                CheckID: None,
+                ServiceID: Some(service_node_id.clone()),
+                Namespace: None,
+            })
+            .await
+            .unwrap();
+        match timeout(
+            Duration::from_secs(1),
+            services_watch.wait_for(|value| match value {
+                Ok(result) => {
+                    let keys: Vec<_> = result.response.keys().cloned().collect();
+                    keys == vec![] as Vec<String>
+                }
+                Err(_) => true,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            other => panic!("timeout or error {other:#?}"),
+        };
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn get_services_nodes() {
         let consul = get_client();
         let req = GetServiceNodesRequest {
@@ -1154,6 +1410,124 @@ mod tests {
             .iter()
             .map(|sn| assert_eq!("dc1", sn.node.datacenter))
             .collect();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn get_service_nodes_watch() {
+        let tag = "filter_service_nodes_watch".to_string();
+        let service_name = "service-nodes-watch".to_string();
+        let filter = format!("\"{tag}\" in Service.Tags");
+        let consul = Arc::new(get_client());
+        let req = GetServiceNodesRequest {
+            service: &service_name,
+            filter: Some(&filter),
+            ..Default::default()
+        };
+        let mut service_nodes_watch = Consul::get_service_nodes_watch(
+            consul.clone(),
+            req,
+            None,
+            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
+        )
+        .await;
+        {
+            let res = service_nodes_watch.borrow_and_update();
+            match res.as_ref() {
+                Ok(result) => {
+                    assert_eq!(result.response, vec![] as Vec<ServiceNode>);
+                }
+                Err(error) => panic!("unexpected error {error:#?}"),
+            }
+        }
+
+        let service_node_1_id = "service-nodes-watch-node-1".to_string();
+        let node_id = "node-services-watch";
+        register_service_node(
+            consul.as_ref(),
+            &service_name,
+            node_id,
+            Some(vec![tag.clone()]),
+            Some(service_node_1_id.clone()),
+        )
+        .await;
+
+        match timeout(
+            Duration::from_secs(10),
+            service_nodes_watch.wait_for(|res| match res {
+                Ok(result) => {
+                    if let [servicenode] = &result.response[..] {
+                        servicenode.service.service == service_name
+                            && servicenode.service.id == service_node_1_id
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => true,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            other => panic!("timeout or error {other:#?}"),
+        }
+
+        let service_node_2_id = "service-nodes-watch-node-2".to_string();
+        let node_id = "node-services-watch";
+        register_service_node(
+            consul.as_ref(),
+            &service_name,
+            node_id,
+            Some(vec![tag.clone()]),
+            Some(service_node_2_id.clone()),
+        )
+        .await;
+
+        match timeout(
+            Duration::from_secs(10),
+            service_nodes_watch.wait_for(|res| match res {
+                Ok(result) => {
+                    if let [servicenode1, servicenode2] = &result.response[..] {
+                        servicenode1.service.service == service_name
+                            && servicenode1.service.id == service_node_1_id
+                            && servicenode2.service.service == service_name
+                            && servicenode2.service.id == service_node_2_id
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => true,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            other => panic!("timeout or error {other:#?}"),
+        }
+
+        consul
+            .deregister_entity(&DeregisterEntityPayload {
+                Node: Some(node_id.to_string()),
+                Datacenter: None,
+                CheckID: None,
+                ServiceID: None,
+                Namespace: None,
+            })
+            .await
+            .unwrap();
+
+        match timeout(
+            Duration::from_secs(10),
+            service_nodes_watch.wait_for(|res| match res {
+                Ok(result) => result.response == vec![] as Vec<ServiceNode>,
+                Err(_) => true,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            other => panic!("timeout or error {other:#?}"),
+        };
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1403,6 +1777,38 @@ mod tests {
                 ID: None,
                 Service: service_name.clone(),
                 Tags: vec![],
+                TaggedAddresses: Default::default(),
+                Meta: Default::default(),
+                Port: Some(42424),
+                Namespace: None,
+            }),
+            Check: None,
+            SkipNodeUpdate: None,
+        };
+        consul
+            .register_entity(&payload)
+            .await
+            .expect("expected register_entity request to succeed");
+    }
+
+    async fn register_service_node(
+        consul: &Consul,
+        service_name: &str,
+        node_id: &str,
+        tags: Option<Vec<String>>,
+        id: Option<String>,
+    ) {
+        let payload = RegisterEntityPayload {
+            ID: None,
+            Node: node_id.to_string(),
+            Address: "127.0.0.1".to_string(),
+            Datacenter: None,
+            TaggedAddresses: Default::default(),
+            NodeMeta: Default::default(),
+            Service: Some(RegisterEntityService {
+                ID: id,
+                Service: service_name.to_string(),
+                Tags: tags.unwrap_or_default(),
                 TaggedAddresses: Default::default(),
                 Meta: Default::default(),
                 Port: Some(42424),
